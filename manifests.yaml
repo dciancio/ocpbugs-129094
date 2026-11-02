@@ -1,0 +1,99 @@
+# OCPBUGS-129094 — NOSRV (no endpoints) Service + Routes
+# Service selector matches nothing → HAProxy NOSRV → expected HTTP 503 on edge/http/reencrypt.
+# Passthrough is included as a negative control (EOF / connection error is expected, not 503).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ocpbugs-129094
+  labels:
+    app.kubernetes.io/name: ocpbugs-129094-reproducer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nosrv-backend
+  namespace: ocpbugs-129094
+  labels:
+    app.kubernetes.io/name: ocpbugs-129094-reproducer
+spec:
+  # Selector matches no Pods → Endpoints empty → router NOSRV
+  selector:
+    app: nosrv-does-not-exist
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+# HTTP (no TLS termination on the route)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: nosrv-http
+  namespace: ocpbugs-129094
+  labels:
+    app.kubernetes.io/name: ocpbugs-129094-reproducer
+spec:
+  to:
+    kind: Service
+    name: nosrv-backend
+  port:
+    targetPort: http
+  wildcardPolicy: None
+---
+# Edge TLS (non-passthrough) — primary reproducer target
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: nosrv-edge
+  namespace: ocpbugs-129094
+  labels:
+    app.kubernetes.io/name: ocpbugs-129094-reproducer
+spec:
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  to:
+    kind: Service
+    name: nosrv-backend
+  port:
+    targetPort: http
+  wildcardPolicy: None
+---
+# Reencrypt (non-passthrough) — same race class as edge
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: nosrv-reencrypt
+  namespace: ocpbugs-129094
+  labels:
+    app.kubernetes.io/name: ocpbugs-129094-reproducer
+spec:
+  tls:
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect
+  to:
+    kind: Service
+    name: nosrv-backend
+  port:
+    targetPort: http
+  wildcardPolicy: None
+---
+# Passthrough — negative control (does not return HTTP 503 from HAProxy)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: nosrv-passthrough
+  namespace: ocpbugs-129094
+  labels:
+    app.kubernetes.io/name: ocpbugs-129094-reproducer
+spec:
+  tls:
+    termination: passthrough
+  to:
+    kind: Service
+    name: nosrv-backend
+  port:
+    targetPort: http
+  wildcardPolicy: None
