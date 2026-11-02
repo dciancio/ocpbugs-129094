@@ -8,13 +8,13 @@
 #
 # Usage:
 #   ./reproducer.sh setup
-#   ./reproducer.sh run [...]              # DEFAULT: realistic curl — natural RST hunt
-#   ./reproducer.sh probe-writefirst [...] # optional: write-first (always BrokenPipe)
+#   ./reproducer.sh run [...]         # write-first: send FULL body before any read
+#   ./reproducer.sh run-compare       # baseline vs fixed (both write-first)
+#   ./reproducer.sh run-curl [...]    # optional interleaved curl hunt (hides race)
 #   ./reproducer.sh fix-apply|fix-status|fix-remove
-#   ./reproducer.sh run-compare            # baseline vs wait-for-body custom LB
 #   ./reproducer.sh cleanup|status
 #
-# Prereqs: oc logged into a cluster; curl. python3 only for probe-writefirst.
+# Prereqs: oc logged into a cluster; python3 (write-first); curl only for run-curl.
 
 set -euo pipefail
 
@@ -23,17 +23,18 @@ NS="${NS:-ocpbugs-129094}"
 MANIFESTS="${SCRIPT_DIR}/manifests.yaml"
 FIX_SCRIPT="${SCRIPT_DIR}/fix-apply-custom-router.sh"
 WORKDIR="${WORKDIR:-${TMPDIR:-/tmp}/ocpbugs-129094}"
-# curl RST is intermittent (~0.5% on some paths) — default high enough to catch one
-ITERATIONS="${ITERATIONS:-300}"
+# write-first: small N is enough (baseline ≈ all RST; fixed ≈ all 503)
+ITERATIONS="${ITERATIONS:-10}"
 SIZES="${SIZES:-1048576}"
 ROUTE_KIND="${ROUTE_KIND:-edge}"
 HOST_OVERRIDE="${HOST_OVERRIDE:-}"
-# When set, curl --resolve pins to this LB (custom wait-for-body router)
+# When set, pin to this LB (custom wait-for-body router)
 ROUTER_ADDR="${ROUTER_ADDR:-}"
-# Stop after first natural RST (realistic event). Set UNTIL_RST=0 to always run full N.
+# Used only by optional run-curl
 UNTIL_RST="${UNTIL_RST:-1}"
-# Body size for optional write-first probe only (not used by default run)
 PROBE_BYTES="${PROBE_BYTES:-1048576}"
+CURL_LIMIT_RATE="${CURL_LIMIT_RATE:-0}"
+PARALLEL="${PARALLEL:-20}"
 
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
@@ -46,6 +47,50 @@ info()  { printf '%sℹ%s  %s\n' "$CYAN" "$NC" "$*"; }
 ok()    { printf '%s✓%s  %s\n' "$GREEN" "$NC" "$*"; }
 warn()  { printf '%s⚠%s  %s\n' "$YELLOW" "$NC" "$*"; }
 err()   { printf '%s✗%s  %s\n' "$RED" "$NC" "$*" >&2; }
+
+# --- pretty output helpers ---
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+[[ -t 1 ]] || { BOLD=; DIM=; }
+
+hr()    { printf '%s────────────────────────────────────────────────────────────%s\n' "$DIM" "$NC"; }
+banner() {
+  local title="$1"
+  echo
+  hr
+  printf '%s%s%s\n' "$BOLD" "$title" "$NC"
+  hr
+}
+kv() { printf '  %-14s %s\n' "$1" "$2"; }
+
+# Human-readable byte size (1048576 → 1MiB)
+fmt_bytes() {
+  local n="$1"
+  if [[ "$n" -ge 1048576 && $((n % 1048576)) -eq 0 ]]; then
+    printf '%sMiB' "$((n / 1048576))"
+  elif [[ "$n" -ge 1024 && $((n % 1024)) -eq 0 ]]; then
+    printf '%sKiB' "$((n / 1024))"
+  else
+    printf '%sB' "$n"
+  fi
+}
+
+print_result_table_header() {
+  printf '\n  %-8s  %-10s  %8s  %8s  %8s  %6s  %s\n' \
+    "ROUTE" "SIZE" "POSTS" "HTTP_503" "RST/ERR" "OTHER" "RESULT"
+  printf '  %s\n' "--------  ----------  --------  --------  --------  ------  ----------------"
+}
+
+print_result_row() {
+  local route="$1" size_label="$2" posts="$3" h503="$4" rst="$5" other="$6" result="$7"
+  local result_fmt="$result"
+  case "$result" in
+    *RST*|*RACE*) result_fmt="${YELLOW}${result}${NC}" ;;
+    *503*|*PASS*|*OK*|*zero*|*clean*) result_fmt="${GREEN}${result}${NC}" ;;
+  esac
+  printf '  %-8s  %-10s  %8s  %8s  %8s  %6s  %b\n' \
+    "$route" "$size_label" "$posts" "$h503" "$rst" "$other" "$result_fmt"
+}
 
 need_oc() {
   command -v oc >/dev/null || { err "oc not found"; exit 1; }
@@ -128,8 +173,8 @@ cmd_setup() {
   echo
   oc -n "$NS" get svc,endpoints,route
   echo
-  ok "Setup complete. Run: $0 run   # curl vs baseline — hunts for a natural RST"
-  info "Optional: $0 probe-writefirst  # write-first client (always BrokenPipe; not realistic)"
+  ok "Setup complete. Run: $0 run   # write-first: full body before any read"
+  info "Compare fix: $0 fix-apply && $0 run-compare"
 }
 
 cmd_cleanup() {
@@ -157,6 +202,10 @@ make_payload() {
 do_one_post() {
   local url="$1" payload="$2" out rc
   shift 2
+  local limit_args=()
+  if [[ -n "${CURL_LIMIT_RATE}" && "${CURL_LIMIT_RATE}" != "0" ]]; then
+    limit_args=(--limit-rate "${CURL_LIMIT_RATE}")
+  fi
   set +e
   out="$(curl -sS -o /dev/null \
     --connect-timeout 10 \
@@ -165,6 +214,7 @@ do_one_post() {
     -H 'Expect:' \
     -X POST \
     --data-binary "@${payload}" \
+    "${limit_args[@]+"${limit_args[@]}"}" \
     "$@" \
     -w '%{http_code} %{exitcode} %{time_total} %{size_upload}' \
     "$url" 2>/dev/null)"
@@ -178,80 +228,154 @@ do_one_post() {
   fi
 }
 
-# Realistic curl matrix against baseline. Does NOT force RST — hunts for a natural
-# race (http_code=000 / curl exit ≠ 0) while most iterations still see HTTP 503.
-# With UNTIL_RST=1 (default), stops at the first RST event and prints it.
+# Classify one curl result line: "http_code exitcode time size_upload"
+# Sets globals _cls_ok503 _cls_rst _cls_other (0/1).
+classify_post_result() {
+  local code="$1" exitc="$2"
+  _cls_ok503=0; _cls_rst=0; _cls_other=0
+  if [[ "$code" == "503" && "$exitc" == "0" ]]; then
+    _cls_ok503=1
+  elif [[ "$code" == "000" || "$exitc" != "0" ]]; then
+    _cls_rst=1
+  else
+    _cls_other=1
+  fi
+}
+
+# Baseline curl matrix — NOT forced (no write-first, no --limit-rate by default).
+# Sequential full-speed almost always gets clean 503. PARALLEL concurrent
+# full-speed curls (same interleaved client) raise the odds of natural exit 56.
 run_matrix_for_route() {
-  local kind="$1" url iterations resolve_args
+  local kind="$1" url iterations resolve_args parallel
   iterations="$ITERATIONS"
+  parallel="${PARALLEL}"
+  [[ "$parallel" =~ ^[0-9]+$ && "$parallel" -ge 1 ]] || parallel=1
   url="$(route_url "$kind")"
   # shellcheck disable=SC2206
   resolve_args=( $(curl_resolve_args "$kind") )
-  info "Route kind=${kind} url=${url} max_iterations=${iterations} until_rst=${UNTIL_RST}"
-  if [[ -n "${ROUTER_ADDR}" ]]; then
-    info "Traffic pinned to router-addr=${ROUTER_ADDR} (custom / fixed path)"
-  else
-    info "Traffic via default DNS/LB (baseline path — realistic curl client)"
-  fi
 
-  local size payload i code exitc ttotal upload
+  printf '\n  %sTarget%s\n' "$BOLD" "$NC"
+  kv "route:" "$kind"
+  kv "url:" "$url"
+  kv "posts:" "${iterations}  (parallel=${parallel}, until_rst=${UNTIL_RST})"
+  if [[ -n "${ROUTER_ADDR}" ]]; then
+    kv "traffic:" "pinned → ${ROUTER_ADDR}"
+  else
+    kv "traffic:" "default DNS / router-default LB"
+  fi
+  kv "client:" "full-speed curl (interleaved; no write-first)"
+  [[ -n "${CURL_LIMIT_RATE}" && "${CURL_LIMIT_RATE}" != "0" ]] && \
+    kv "limit-rate:" "${CURL_LIMIT_RATE} (optional)"
+
+  local size payload i code exitc ttotal upload size_label
   local -i ok503=0 fail_rst=0 other=0 ran=0
   local -i route_saw_rst=0
+  local batch_dir j batch_n
+  local header_printed=0
 
   IFS=',' read -r -a size_arr <<< "$SIZES"
-  printf '\n%-10s %-8s %-10s %-10s %-10s %s\n' \
-    "SIZE" "RAN" "HTTP_503" "RST/ERR" "OTHER" "NOTES"
-  printf '%s\n' "--------------------------------------------------------------------------"
 
   for size in "${size_arr[@]}"; do
     size="$(echo "$size" | tr -d '[:space:]')"
     [[ -n "$size" ]] || continue
+    size_label="$(fmt_bytes "$size")"
     payload="${WORKDIR}/body-${size}.bin"
     make_payload "$size" "$payload"
     ok503=0; fail_rst=0; other=0; ran=0
 
-    for ((i = 1; i <= iterations; i++)); do
-      ran=$((ran + 1))
-      read -r code exitc ttotal upload <<< \
-        "$(do_one_post "$url" "$payload" "${resolve_args[@]+"${resolve_args[@]}"}")"
-      if [[ "$code" == "503" && "$exitc" == "0" ]]; then
-        ok503=$((ok503 + 1))
-      elif [[ "$code" == "000" || "$exitc" != "0" ]]; then
-        # Natural race: RST/FIN before curl finished reading a status line
-        fail_rst=$((fail_rst + 1))
-        route_saw_rst=1
-        warn "NATURAL RST event  kind=${kind} size=${size}B iter=${i}/${iterations}  http_code=${code} curl_exit=${exitc} time=${ttotal}s size_upload=${upload}"
-        if [[ "${UNTIL_RST}" == "1" && "$kind" != "passthrough" ]]; then
-          info "Stopping early (UNTIL_RST=1) — real-life RST observed without write-first force"
-          break
+    if [[ "$header_printed" -eq 0 ]]; then
+      print_result_table_header
+      header_printed=1
+    fi
+    printf '  %shunting%s %s × %s …\n' "$DIM" "$NC" "$kind" "$size_label"
+
+    i=0
+    while (( i < iterations )); do
+      if [[ "$parallel" -eq 1 ]]; then
+        i=$((i + 1))
+        ran=$((ran + 1))
+        read -r code exitc ttotal upload <<< \
+          "$(do_one_post "$url" "$payload" "${resolve_args[@]+"${resolve_args[@]}"}")"
+        classify_post_result "$code" "$exitc"
+        if [[ "$_cls_ok503" -eq 1 ]]; then
+          ok503=$((ok503 + 1))
+        elif [[ "$_cls_rst" -eq 1 ]]; then
+          fail_rst=$((fail_rst + 1))
+          route_saw_rst=1
+          printf '\n  %s▶ NATURAL RST/ERR%s  post %s/%s\n' "$YELLOW" "$NC" "$i" "$iterations"
+          kv "http_code:" "$code"
+          kv "curl_exit:" "$exitc"
+          kv "time:" "${ttotal}s"
+          kv "uploaded:" "$(fmt_bytes "${upload:-0}")"
+          if [[ "${UNTIL_RST}" == "1" && "$kind" != "passthrough" ]]; then
+            info "Stopping early (UNTIL_RST=1)"
+            break
+          fi
+        else
+          other=$((other + 1))
         fi
       else
-        other=$((other + 1))
+        batch_n="$parallel"
+        if (( i + batch_n > iterations )); then
+          batch_n=$((iterations - i))
+        fi
+        batch_dir="${WORKDIR}/batch-$$-${i}"
+        mkdir -p "$batch_dir"
+        for ((j = 0; j < batch_n; j++)); do
+          (
+            do_one_post "$url" "$payload" "${resolve_args[@]+"${resolve_args[@]}"}" \
+              > "${batch_dir}/${j}.out"
+          ) &
+        done
+        wait
+        for ((j = 0; j < batch_n; j++)); do
+          i=$((i + 1))
+          ran=$((ran + 1))
+          read -r code exitc ttotal upload <<< "$(cat "${batch_dir}/${j}.out")"
+          classify_post_result "$code" "$exitc"
+          if [[ "$_cls_ok503" -eq 1 ]]; then
+            ok503=$((ok503 + 1))
+          elif [[ "$_cls_rst" -eq 1 ]]; then
+            fail_rst=$((fail_rst + 1))
+            route_saw_rst=1
+            printf '\n  %s▶ NATURAL RST/ERR%s  post %s/%s\n' "$YELLOW" "$NC" "$i" "$iterations"
+            kv "http_code:" "$code"
+            kv "curl_exit:" "$exitc"
+            kv "time:" "${ttotal}s"
+            kv "uploaded:" "$(fmt_bytes "${upload:-0}")"
+          else
+            other=$((other + 1))
+          fi
+        done
+        rm -rf "$batch_dir"
+        if [[ "${UNTIL_RST}" == "1" && "$fail_rst" -gt 0 && "$kind" != "passthrough" ]]; then
+          info "Stopping early (UNTIL_RST=1)"
+          break
+        fi
       fi
-      # progress every 50 iters when hunting
-      if (( i % 50 == 0 && fail_rst == 0 )); then
-        info "… ${i}/${iterations} still HTTP 503 (hunting natural RST)"
+      if (( ran % 100 == 0 && fail_rst == 0 )); then
+        printf '  %s… %s/%s clean HTTP 503%s\n' "$DIM" "$ran" "$iterations" "$NC"
       fi
     done
 
     local note=""
     if [[ "$kind" == "passthrough" ]]; then
-      note="neg-control (503 not expected)"
+      note="neg-control"
     elif (( fail_rst > 0 )); then
-      note="NATURAL RST OBSERVED"
+      note="RST OBSERVED"
     elif (( ok503 == ran )); then
-      note="all 503 (no RST this run — raise -n)"
+      note="all clean 503"
+    else
+      note="mixed"
     fi
 
-    printf '%-10s %-8s %-10s %-10s %-10s %s\n' \
-      "${size}B" "$ran" "$ok503" "$fail_rst" "$other" "$note"
+    print_result_row "$kind" "$size_label" "$ran" "$ok503" "$fail_rst" "$other" "$note"
 
     if [[ "${UNTIL_RST}" == "1" && "$fail_rst" -gt 0 && "$kind" != "passthrough" ]]; then
       break
     fi
   done
   echo
-  # Stash for cmd_run exit status (0 = saw natural RST on non-passthrough)
   if [[ "$kind" != "passthrough" && "$route_saw_rst" -eq 1 ]]; then
     return 0
   elif [[ "$kind" == "passthrough" ]]; then
@@ -274,8 +398,9 @@ resolve_route_ip() {
   printf '%s' "$ip"
 }
 
-# Optional write-first client (NOT the default). Sends full body before any read —
-# almost always BrokenPipe on NOSRV. Useful as a detector, not a realistic client.
+# Write-first client: send headers + FULL body (sendall) before any recv.
+# Matches SDKs that finish the upload before reading the status line.
+# Baseline NOSRV → BrokenPipe/RST; fixed (wait-for-body+bufsize) → HTTP 503.
 run_writefirst_for_route_size() {
   local kind="$1" bytes="$2" host ip port url_scheme iters
   iters="$ITERATIONS"
@@ -288,7 +413,8 @@ run_writefirst_for_route_size() {
   esac
 
   PROBE_HOST="$host" PROBE_IP="$ip" PROBE_PORT="$port" PROBE_SCHEME="$url_scheme" \
-  PROBE_BYTES="$bytes" PROBE_ITERS="$iters" PROBE_KIND="$kind" python3 - <<'PY'
+  PROBE_BYTES="$bytes" PROBE_ITERS="$iters" PROBE_KIND="$kind" \
+  PROBE_EXPECT="${PROBE_EXPECT:-rst}" python3 - <<'PY'
 import collections, os, socket, ssl, sys
 
 host = os.environ["PROBE_HOST"]
@@ -361,6 +487,7 @@ for _ in range(iters):
 total = sum(counts.values()) or 1
 rst = counts["rst_during_write"] + counts["empty_reply_after_full_write"]
 http503 = counts["http_503"]
+expect = os.environ.get("PROBE_EXPECT", "rst")  # rst | no_rst
 note = ""
 if kind == "passthrough":
     note = "neg-control"
@@ -368,23 +495,37 @@ elif rst == total:
     note = "RST EVERY TIME"
 elif rst > 0:
     note = "PARTIAL RST"
+elif http503 == total:
+    note = "HTTP_503 EVERY TIME (no RST)"
 else:
-    note = "NO RST (unexpected for NOSRV)"
+    note = "MIXED/OTHER"
 
-print(f"{kind:12} {nbytes}B  iters={iters}  RST={rst}/{total}  HTTP_503={http503}/{total}  {note}")
-print(f"  detail: {dict(counts)}")
+def fmt_bytes(n):
+    if n >= 1048576 and n % 1048576 == 0:
+        return f"{n // 1048576}MiB"
+    if n >= 1024 and n % 1024 == 0:
+        return f"{n // 1024}KiB"
+    return f"{n}B"
+
+size_l = fmt_bytes(nbytes)
+other = total - rst - http503
+# Align with bash print_result_row columns
+print(f"  {kind:<8}  {size_l:<10}  {total:>8}  {http503:>8}  {rst:>8}  {other:>6}  {note}")
+if other > 0 or (rst not in (0, total) and http503 not in (0, total)):
+    print(f"           detail: {dict(counts)}")
 
 if kind == "passthrough":
     sys.exit(0)
-if rst == total:
-    sys.exit(0)
-sys.exit(1)
+if expect == "no_rst":
+    sys.exit(0 if rst == 0 and http503 == total else 1)
+# default: expect all RST (bug present on baseline)
+sys.exit(0 if rst == total else 1)
 PY
 }
 
 cmd_run() {
   need_oc
-  command -v curl >/dev/null || { err "curl not found"; exit 1; }
+  command -v python3 >/dev/null || { err "python3 required for write-first client"; exit 1; }
   mkdir -p "$WORKDIR"
 
   if ! oc -n "$NS" get svc nosrv-backend >/dev/null 2>&1; then
@@ -392,21 +533,83 @@ cmd_run() {
     exit 1
   fi
 
+  local kinds=() expect="rst" title_router="router-default (DNS/LB)"
+  case "$ROUTE_KIND" in
+    all) kinds=(http edge reencrypt passthrough) ;;
+    *)   kinds=("$ROUTE_KIND") ;;
+  esac
+  if [[ -n "${ROUTER_ADDR}" ]]; then
+    expect="no_rst"
+    title_router="${ROUTER_ADDR} (pinned — expect no RST if fix works)"
+  fi
+
+  banner "OCPBUGS-129094  ·  run  ·  write-first (full body send)"
+  kv "client:" "sendall(headers + full body) before any recv"
+  kv "sizes:" "$SIZES"
+  kv "iters:" "$ITERATIONS"
+  kv "router:" "$title_router"
+  kv "expect:" "$([[ "$expect" == "rst" ]] && echo "RST every iter (NOSRV race)" || echo "HTTP 503 every iter (RST=0)")"
+  print_result_table_header
+
+  local k size rc=0 any_fail=0
+  IFS=',' read -r -a size_arr <<< "$SIZES"
+  for k in "${kinds[@]}"; do
+    for size in "${size_arr[@]}"; do
+      size="$(echo "$size" | tr -d '[:space:]')"
+      [[ -n "$size" ]] || continue
+      set +e
+      PROBE_EXPECT="$expect" ITERATIONS="$ITERATIONS" \
+        run_writefirst_for_route_size "$k" "$size"
+      rc=$?
+      set -e
+      if [[ "$k" != "passthrough" && "$rc" -ne 0 ]]; then
+        any_fail=1
+      fi
+    done
+  done
+
+  banner "Summary"
+  if [[ "$any_fail" -eq 0 ]]; then
+    if [[ "$expect" == "rst" ]]; then
+      ok "Full-body send hit RST every time (bug reproduced on baseline)"
+    else
+      ok "Full-body send got HTTP 503 with zero RST (fix path OK)"
+    fi
+  else
+    if [[ "$expect" == "rst" ]]; then
+      err "Expected RST on full-body send — check fixtures / router-default path"
+    else
+      err "Expected zero RST on fix path — check wait-for-body + tune.bufsize"
+    fi
+    return 1
+  fi
+  echo
+  printf '  %sLegend%s\n' "$BOLD" "$NC"
+  kv "RST/ERR:"  "BrokenPipe during sendall (503 lost to RST)"
+  kv "HTTP_503:" "full body accepted, then NOSRV 503 (no RST during write)"
+  echo
+}
+
+# Optional: interleaved curl (hides race). Not used by run / run-compare.
+cmd_run_curl() {
+  need_oc
+  command -v curl >/dev/null || { err "curl not found"; exit 1; }
+  mkdir -p "$WORKDIR"
+  if ! oc -n "$NS" get svc nosrv-backend >/dev/null 2>&1; then
+    err "Fixtures missing — run: $0 setup"
+    exit 1
+  fi
   local kinds=()
   case "$ROUTE_KIND" in
     all) kinds=(http edge reencrypt passthrough) ;;
     *)   kinds=("$ROUTE_KIND") ;;
   esac
 
-  echo
-  info "OCPBUGS-129094 — realistic curl baseline (does NOT force RST)"
-  info "Interleaved upload/read like a normal HTTP client; hunts for a natural race"
-  info "Body sizes: ${SIZES}  max_iters=${ITERATIONS}  UNTIL_RST=${UNTIL_RST}"
-  if [[ -n "${ROUTER_ADDR}" ]]; then
-    info "Traffic pinned to router-addr=${ROUTER_ADDR}"
-  else
-    info "Traffic via default DNS/LB (router-default baseline)"
-  fi
+  banner "OCPBUGS-129094  ·  run-curl  ·  interleaved (optional)"
+  kv "note:" "Reads mid-upload — usually clean HTTP 503; RST rare"
+  kv "sizes:" "$SIZES"
+  kv "posts:" "$ITERATIONS"
+  kv "parallel:" "$PARALLEL"
   echo
 
   local k rc=0 saw=0
@@ -417,78 +620,89 @@ cmd_run() {
     set -e
     if [[ "$k" != "passthrough" && "$rc" -eq 0 ]]; then
       saw=1
-      if [[ "${UNTIL_RST}" == "1" ]]; then
-        break
-      fi
+      [[ "${UNTIL_RST}" == "1" ]] && break
     fi
   done
-  echo
+  banner "Summary"
   if [[ "$saw" -eq 1 ]]; then
-    ok "Natural RST observed on baseline with realistic curl (not write-first forced)"
+    ok "Natural RST/ERR seen with interleaved curl"
   else
-    warn "No natural RST in this run (curl often gets 503). Retry with -n 1000 or UNTIL_RST=1"
-    info "Forced detector (not realistic): $0 probe-writefirst --iterations 10"
+    warn "No natural RST (typical for curl). Use: $0 run  # write-first full body"
     return 1
   fi
-  cat <<'EOF'
-
-Interpretation
-  NATURAL RST  — curl exit ≠ 0 / http_code=000 while uploading (real race)
-  HTTP_503     — curl read the 503 mid-upload (common; race not visible this attempt)
-  passthrough  — negative control (no HAProxy HTTP 503)
-
-Optional forced detector:  ./reproducer.sh probe-writefirst --iterations 10
-EOF
+  echo
 }
 
 cmd_probe_writefirst() {
-  need_oc
-  command -v python3 >/dev/null || { err "python3 required"; exit 1; }
-  mkdir -p "$WORKDIR"
-  if ! oc -n "$NS" get svc nosrv-backend >/dev/null 2>&1; then
-    err "Fixtures missing — run: $0 setup"
-    exit 1
-  fi
-  local kinds=()
-  case "$ROUTE_KIND" in
-    all) kinds=(http edge reencrypt passthrough) ;;
-    *)   kinds=("$ROUTE_KIND") ;;
-  esac
-  SIZES="${SIZES:-$PROBE_BYTES}"
-  # For the probe, a small iteration count is enough (almost always RST)
-  if [[ "${ITERATIONS}" -gt 30 ]]; then
-    ITERATIONS=10
-  fi
-  echo
-  warn "write-first probe — FORCED detector (not a realistic client)"
-  info "Sends full body before any read; expects BrokenPipe nearly every time"
-  echo
-  printf '%s\n' "KIND         SIZE      RESULTS"
-  printf '%s\n' "--------------------------------------------------------------------------"
-  local k size
-  IFS=',' read -r -a size_arr <<< "$SIZES"
-  for k in "${kinds[@]}"; do
-    for size in "${size_arr[@]}"; do
-      size="$(echo "$size" | tr -d '[:space:]')"
-      [[ -n "$size" ]] || continue
-      run_writefirst_for_route_size "$k" "$size" || true
-    done
-  done
+  # Back-compat alias → same as run (write-first full body)
+  cmd_run
 }
 
 cmd_run_compare() {
   need_oc
-  local addr
+  command -v python3 >/dev/null || { err "python3 required for write-first compare"; exit 1; }
+  mkdir -p "$WORKDIR"
+  local addr size cmp_iters rc size_label
   addr="$(custom_lb_addr)"
   [[ -n "$addr" ]] || { err "custom LB not found — run: $0 fix-apply"; exit 1; }
 
-  echo
-  info "=== BASELINE (default Ingress LB / DNS) — realistic curl ==="
-  ROUTER_ADDR="" UNTIL_RST="${UNTIL_RST:-1}" cmd_run || true
+  cmp_iters="${COMPARE_ITERATIONS:-${ITERATIONS:-10}}"
+  [[ "$cmp_iters" -gt 30 ]] && cmp_iters=10
+  size="$(echo "${SIZES:-1048576}" | tr ',' '\n' | head -1 | tr -d '[:space:]')"
+  size_label="$(fmt_bytes "$size")"
+  [[ "$ROUTE_KIND" == "all" ]] && ROUTE_KIND=edge
 
+  banner "OCPBUGS-129094  ·  run-compare  ·  write-first (full body send)"
+  kv "question:" "Does wait-for-body + ROUTER_BUF_SIZE eliminate RST?"
+  kv "client:" "sendall(headers + full body) before any recv"
+  kv "route:" "$ROUTE_KIND"
+  kv "body:" "$size_label ($size bytes)"
+  kv "iters:" "$cmp_iters"
+  kv "fixed LB:" "$addr"
+
+  # --- baseline ---
+  banner "1/2  BASELINE  ·  router-default"
+  printf '  expect:  RST=%s/%s  (full-body send hits BrokenPipe)\n\n' "$cmp_iters" "$cmp_iters"
+  print_result_table_header
+  set +e
+  ROUTER_ADDR="" ITERATIONS="$cmp_iters" PROBE_EXPECT=rst \
+    run_writefirst_for_route_size "$ROUTE_KIND" "$size"
+  rc=$?
+  set -e
   echo
-  info "=== FIXED (custom router + wait-for-body @ ${addr}) — realistic curl ==="
-  ROUTER_ADDR="$addr" UNTIL_RST=0 cmd_run || true
+  if [[ "$rc" -ne 0 ]]; then
+    err "Baseline did not RST every iter — check fixtures / LB path"
+    return 1
+  fi
+  ok "Baseline: full-body send → RST reproduced"
+
+  # --- fixed ---
+  banner "2/2  FIXED  ·  custom router + wait-for-body"
+  printf '  expect:  RST=0/%s   HTTP_503=%s/%s  (full body buffered, then 503)\n\n' \
+    "$cmp_iters" "$cmp_iters" "$cmp_iters"
+  print_result_table_header
+  set +e
+  ROUTER_ADDR="$addr" ITERATIONS="$cmp_iters" PROBE_EXPECT=no_rst \
+    run_writefirst_for_route_size "$ROUTE_KIND" "$size"
+  rc=$?
+  set -e
+  echo
+  if [[ "$rc" -ne 0 ]]; then
+    err "Fixed path still saw RST (or not all 503)"
+    echo
+    printf '  %sHint%s\n' "$BOLD" "$NC"
+    kv "check:" "tune.bufsize >= body and wait-for-body in haproxy.config"
+    kv "re-apply:" "ROUTER_BUF_SIZE=2097152 ./reproducer.sh fix-apply"
+    return 1
+  fi
+  ok "Fixed: full-body send → HTTP 503, zero RST"
+
+  banner "Verdict"
+  ok "wait-for-body + bufsize eliminates RST for full-body ${size_label} POST"
+  kv "baseline:" "RST every time (sendall BrokenPipe)"
+  kv "fixed:"    "HTTP 503 every time (RST=0)"
+  echo
+  return 0
 }
 
 usage() {
@@ -498,17 +712,16 @@ OCPBUGS-129094 reproducer — NOSRV large-POST 503/RST race
 Usage:
   ./reproducer.sh setup
   ./reproducer.sh run [--route edge|http|reencrypt|passthrough|all]
-                      [--iterations N] [--sizes BYTES,...] [--host HOST]
-                      [--router-addr IP|HOSTNAME] [--namespace NAME]
-                      [--until-rst|--no-until-rst]
-      # DEFAULT: realistic curl — hunts for a natural RST (does not force one)
-  ./reproducer.sh probe-writefirst [...]  # optional forced BrokenPipe detector
+                      [--iterations N] [--sizes BYTES,...]
+                      [--host HOST] [--router-addr IP|HOSTNAME]
+      # write-first: send FULL POST body before reading (default)
+  ./reproducer.sh run-compare [--route edge] [--sizes BYTES]
+      # baseline vs fixed — both write-first full-body send
+  ./reproducer.sh run-curl [...]   # optional interleaved curl (hides race)
   ./reproducer.sh fix-apply | fix-status | fix-remove
-  ./reproducer.sh run-compare             # baseline vs wait-for-body custom LB
   ./reproducer.sh status | cleanup
 
-Env defaults: NS=ocpbugs-129094 ITERATIONS=300 SIZES=1048576 ROUTE_KIND=edge
-              UNTIL_RST=1 (stop at first natural RST)
+Env defaults: NS=ocpbugs-129094 ITERATIONS=10 SIZES=1048576 ROUTE_KIND=edge
 
 Bug: https://issues.redhat.com/browse/OCPBUGS-129094
 EOF
@@ -528,6 +741,9 @@ while [[ $# -gt 0 ]]; do
     --workdir)        WORKDIR="$2"; shift 2 ;;
     --until-rst)      UNTIL_RST=1; shift ;;
     --no-until-rst)   UNTIL_RST=0; shift ;;
+    --parallel|-p)    PARALLEL="$2"; shift 2 ;;
+    --limit-rate)     CURL_LIMIT_RATE="$2"; shift 2 ;;
+    --full-speed)     CURL_LIMIT_RATE=0; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) err "unknown arg: $1"; usage; exit 1 ;;
   esac
@@ -536,9 +752,9 @@ done
 case "${ACTION}" in
   setup)             cmd_setup ;;
   run)               cmd_run ;;
-  run-curl)          cmd_run ;; # back-compat alias
+  run-curl)          cmd_run_curl ;;
   run-compare)       cmd_run_compare ;;
-  probe-writefirst)  cmd_probe_writefirst ;;
+  probe-writefirst)  cmd_probe_writefirst ;; # alias of run
   fix-apply)         bash "$FIX_SCRIPT" apply ;;
   fix-status)        bash "$FIX_SCRIPT" status ;;
   fix-remove)        bash "$FIX_SCRIPT" remove ;;

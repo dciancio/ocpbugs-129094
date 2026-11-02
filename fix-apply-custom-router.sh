@@ -31,9 +31,24 @@ REPLICAS="${REPLICAS:-1}"
 WORKDIR="${WORKDIR:-${TMPDIR:-/tmp}/ocpbugs-129094-fix}"
 # Buffer POST/PUT/PATCH bodies before routing so NOSRV 503 is not emitted
 # while the client is still uploading (mitigates 503 vs RST race).
+#
+# Do NOT use a small "at-least N" (e.g. 1k): wait ends after N bytes, then
+# NOSRV 503/RST still races the remainder of a large upload.
+# Even without at-least, HAProxy stops waiting when tune.bufsize is full
+# (OCP router default 32768). Lab fix raises ROUTER_BUF_SIZE (default 2 MiB)
+# so a 1 MiB NOSRV POST can be fully buffered before the 503 — eliminating
+# the RST race for the reproducer payload. Memory cost; lab-only.
+#
 # HAProxy 2.8 (OCP router) has METH_POST/METH_PUT but not METH_PATCH —
 # use `{ method PATCH }` for PATCH. POST is the OCPBUGS-129094 trigger.
-WAIT_FOR_BODY_LINE="${WAIT_FOR_BODY_LINE:-http-request wait-for-body time 5s at-least 1k if METH_POST or METH_PUT or { method PATCH }}"
+#
+# IMPORTANT: do not use ${VAR:-...{ }...} — the ACL's closing "}" terminates
+# the parameter expansion early and can append a stray "}".
+if [[ -z "${WAIT_FOR_BODY_LINE+x}" ]]; then
+  WAIT_FOR_BODY_LINE='http-request wait-for-body time 30s if METH_POST or METH_PUT or { method PATCH }'
+fi
+# tune.bufsize via OpenShift router env (must be > body size to absorb full POST)
+ROUTER_BUF_SIZE="${ROUTER_BUF_SIZE:-2097152}"
 
 CYAN=$'\033[0;36m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; RED=$'\033[0;31m'; NC=$'\033[0m'
 [[ -t 1 ]] || { CYAN=; GREEN=; YELLOW=; RED=; NC=; }
@@ -78,9 +93,9 @@ PY
 
 build_custom_deploy_json() {
   local source_json="$1" out_json="$2"
-  python3 - "$source_json" "$out_json" "$CUSTOM_DEPLOY" "$CUSTOM_CM" "$REPLICAS" <<'PY'
+  python3 - "$source_json" "$out_json" "$CUSTOM_DEPLOY" "$CUSTOM_CM" "$REPLICAS" "$ROUTER_BUF_SIZE" <<'PY'
 import json, sys
-src, out, name, cm, replicas = sys.argv[1:6]
+src, out, name, cm, replicas, bufsize = sys.argv[1:7]
 d = json.load(open(src))
 # Strip cluster status / ownership
 for k in ("status", "managedFields"):
@@ -135,6 +150,8 @@ set_env("ROUTER_SERVICE_NAME", name.replace("router-", "") if name.startswith("r
 set_env("TEMPLATE_FILE", "/var/lib/haproxy/conf/custom/haproxy-config.template")
 # Required when a second router also serves the same routes as router-default
 set_env("ROUTER_DISABLE_NAMESPACE_OWNERSHIP_CHECK", "true")
+# Raise request buffer so wait-for-body can absorb large NOSRV POSTs (lab)
+set_env("ROUTER_BUF_SIZE", str(bufsize))
 # Unique stats identity; keep domain from source so route Host headers still match
 if "ROUTER_CANONICAL_HOSTNAME" in env and "value" in env["ROUTER_CANONICAL_HOSTNAME"]:
     domain = env.get("ROUTER_DOMAIN", {}).get("value", "")
@@ -203,6 +220,9 @@ cmd_apply() {
     "${WORKDIR}/source-deploy.json" \
     "${WORKDIR}/custom-deploy.json"
   oc apply -f "${WORKDIR}/custom-deploy.json"
+  # ConfigMap changes do not always roll the Deployment; force remount + haproxy regen
+  info "Restarting ${CUSTOM_DEPLOY} so the new template is loaded"
+  oc -n "$INGRESS_NS" rollout restart "deploy/${CUSTOM_DEPLOY}"
 
   info "Creating NetworkPolicy (openshift-ingress has deny-all; mirror router-default allow)"
   oc -n "$INGRESS_NS" apply -f - <<EOF
@@ -270,15 +290,28 @@ EOF
     sleep 5
   done
 
-  # Verify generated config contains wait-for-body
+  # Verify on a Ready pod only (avoid stale terminating replicas)
   local cpod
-  cpod="$(oc -n "$INGRESS_NS" get pod -l "app=${CUSTOM_DEPLOY}" \
-    --field-selector=status.phase=Running \
-    -o jsonpath='{.items[0].metadata.name}')"
-  info "Verifying generated haproxy.config in pod/${cpod}"
+  cpod="$(oc -n "$INGRESS_NS" get pods -l "app=${CUSTOM_DEPLOY}" -o json | python3 -c '
+import json,sys
+for p in json.load(sys.stdin)["items"]:
+    cs=(p.get("status") or {}).get("containerStatuses") or [{}]
+    if (p.get("status") or {}).get("phase")=="Running" and cs and cs[0].get("ready"):
+        print(p["metadata"]["name"]); break
+')"
+  [[ -n "$cpod" ]] || { err "No Ready custom router pod"; exit 1; }
+  info "Verifying generated haproxy.config in Ready pod/${cpod}"
   oc -n "$INGRESS_NS" exec "$cpod" -- printenv TEMPLATE_FILE
-  oc -n "$INGRESS_NS" exec "$cpod" -- grep -n 'wait-for-body' haproxy.config | head -20 \
+  oc -n "$INGRESS_NS" exec "$cpod" -- printenv ROUTER_BUF_SIZE || true
+  oc -n "$INGRESS_NS" exec "$cpod" -- grep -nE 'wait-for-body|tune.bufsize' haproxy.config | head -20 \
     || warn "wait-for-body not yet in haproxy.config (reload pending?)"
+  local bsz
+  bsz="$(oc -n "$INGRESS_NS" exec "$cpod" -- awk '/tune.bufsize/{print $2; exit}' haproxy.config 2>/dev/null || true)"
+  if [[ -z "$bsz" || "$bsz" -lt 1048576 ]]; then
+    err "tune.bufsize=${bsz:-missing} < 1MiB — 1MiB POSTs will still RST; fix ROUTER_BUF_SIZE and re-apply"
+    exit 1
+  fi
+  ok "tune.bufsize=${bsz} (>= 1MiB) + wait-for-body present"
 
   echo
   ok "Custom router applied"
@@ -286,11 +319,9 @@ EOF
   if [[ -n "$ip" ]]; then
     ok "EXTERNAL: ${ip}"
     echo
-    info "Compare baseline vs fixed (use route Host header):"
-    echo "  # baseline (default LB) — expect intermittent RST on large POST"
-    echo "  ./reproducer.sh run --route edge"
-    echo "  # fixed custom router"
-    echo "  ./reproducer.sh run --route edge --router-addr ${ip}"
+    info "Prove RST eliminated (write-first — not full-speed curl):"
+    echo "  ./reproducer.sh run-compare --route edge --sizes 1048576"
+    echo "  # or: ./reproducer.sh probe-writefirst --route edge --router-addr ${ip}"
   else
     warn "EXTERNAL-IP not ready yet — check: oc -n ${INGRESS_NS} get svc ${CUSTOM_SVC}"
   fi
