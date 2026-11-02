@@ -692,7 +692,7 @@ cmd_run_compare() {
     echo
     printf '  %sHint%s\n' "$BOLD" "$NC"
     kv "check:" "tune.bufsize >= body and wait-for-body in haproxy.config"
-    kv "re-apply:" "ROUTER_BUF_SIZE=2097152 ./reproducer.sh fix-apply"
+    kv "re-apply:" "./reproducer.sh fix-apply -y"
     return 1
   fi
   ok "Fixed: full-body send → HTTP 503, zero RST"
@@ -718,7 +718,8 @@ Usage:
   ./reproducer.sh run-compare [--route edge] [--sizes BYTES]
       # baseline vs fixed — both write-first full-body send
   ./reproducer.sh run-curl [...]   # optional interleaved curl (hides race)
-  ./reproducer.sh fix-apply | fix-status | fix-remove
+  ./reproducer.sh fix-apply [-y] [--buf-size N] [--keep-alive 5s] ...
+  ./reproducer.sh fix-status | fix-remove
   ./reproducer.sh status | cleanup
 
 Env defaults: NS=ocpbugs-129094 ITERATIONS=10 SIZES=1048576 ROUTE_KIND=edge
@@ -755,7 +756,7 @@ case "${ACTION}" in
   run-curl)          cmd_run_curl ;;
   run-compare)       cmd_run_compare ;;
   probe-writefirst)  cmd_probe_writefirst ;; # alias of run
-  fix-apply)         bash "$FIX_SCRIPT" apply ;;
+  fix-apply)         bash "$FIX_SCRIPT" apply "${@:2}" ;;
   fix-status)        bash "$FIX_SCRIPT" status ;;
   fix-remove)        bash "$FIX_SCRIPT" remove ;;
   cleanup)           cmd_cleanup ;;
